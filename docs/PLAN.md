@@ -183,7 +183,8 @@ Check each client's current documentation before the pilot; this changes.
 
 Each step is merged when it has tests and runs in Docker.
 
-**P1, in the Sliqtly repo (`mcp-go/`): file-system store**
+**P1, in the Sliqtly repo (`mcp-go/`): file-system store**  
+_Done on the Sliqtly branch `claude/confident-curie-i6n4po`: `-data` / `SLIQTLY_DATA`, plus a first viewer (`/`, `/s/{id}` as server-drawn slides, `/s/{id}/{n}.jpg`, `/s/{id}/overview.jpg`) and `SLIQTLY_TOKEN`. Usage in `mcp-go/README.md` there._
 - `fsstore.go`: `DB` and `Bucket` on a folder; `SLIQTLY_STORE=fs`,
   `SLIQTLY_DATA`.
 - `host_file_url` so file URLs point at `SLIQTLY_URL/files/...`.
