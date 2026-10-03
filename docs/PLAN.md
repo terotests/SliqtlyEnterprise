@@ -39,7 +39,7 @@ Source: [terotests/sliqtly](https://github.com/terotests/sliqtly).
 | Editor (`web/dist`) | static, built with Ranger, served by Firebase Hosting | `web/sliqtly.js` loads the Firebase SDK and `/__/firebase/init.js` (exists only on Firebase Hosting); `REDIRECT_HOSTS` hard-coded |
 | Sign-in | Firebase Auth, Google accounts only | the browser talks to Firebase Auth directly |
 | Data | Firestore `decks`, `shares`, `mcp_keys`, `mcp_oauth_*`; Storage `shares/{id}/…`, `users/{uid}/…` | the browser reads and writes Firestore and Storage directly, guarded by `firestore.rules` / `storage.rules` |
-| MCP server | `mcp/` (Node, Cloud Function, in production) and `mcp-go/` (Ranger compiled to Go, Cloud Run, prototype) | Firestore, GCS and Firebase ID tokens, all behind interfaces in `mcp-go/host.go` |
+| MCP server | `mcp/` (Node, Cloud Function, in production) and `mcp-go/` (Ranger compiled to Go, Cloud Run, prototype); Enterprise uses the Go server only | Firestore, GCS and Firebase ID tokens, all behind interfaces in `mcp-go/host.go` |
 | MCP sign-in | the server is its own OAuth 2.1 authorization server (RFC 8414, 9728, 7591, PKCE S256); `/oauth.html` signs the person in with Firebase and hands back an ID token | identity comes from Firebase |
 | Chart data | `bind_chart_data` and pictures fetch public https URLs only (SSRF guard in `mcp/src/deck.js`, `mcp-go/net.go`) | none, but internal sources are refused |
 
@@ -83,11 +83,13 @@ pinned upstream Sliqtly ref.
 
 ### 3.1 Storage drivers
 
-Selected by environment:
+Postgres is the default everywhere, so local, AWS and Google run and are
+tested the same way. Firestore stays as an option for a Google customer who
+prefers it (the existing driver). Selected by environment:
 
 | Setting | Values | Local | GCP | AWS |
 | --- | --- | --- | --- | --- |
-| `SLIQTLY_DB` | `postgres`, `sqlite`, `firestore` | postgres | firestore or Cloud SQL | RDS postgres |
+| `SLIQTLY_DB` | `postgres`, `firestore` | postgres | Cloud SQL postgres (default) or Firestore | RDS postgres |
 | `SLIQTLY_FILES` | `s3`, `disk`, `gcs` | s3 (MinIO) | gcs | s3 |
 
 The `DB` interface is document-shaped (collection, id, JSON). Postgres keeps
@@ -184,14 +186,24 @@ browser or the deck. Everything else keeps the public-only rule (and the
 metadata-server block always applies). Outbound access can also be switched
 off entirely (`SLIQTLY_OUTBOUND=none`).
 
-### 3.7 Sharing inside a company
+### 3.7 Sharing
 
-Upstream shares are "anyone with the link". Enterprise adds a policy,
-`SHARE_POLICY`:
+Both inside and outside the company. The owner picks per share:
 
-- `org` (default): a share opens only for signed-in users of this deployment
-- `link`: as upstream
-- per-share override when the admin allows it
+- **Company**: opens only for signed-in users of this deployment
+- **Link**: anyone with the link, as upstream, for customers, partners and
+  the public; optional expiry date and revoke
+
+Admin settings decide what owners may choose:
+
+| Setting | Values | Default |
+| --- | --- | --- |
+| `SHARE_DEFAULT` | `org`, `link` | `org` |
+| `SHARE_EXTERNAL` | `on`, `off`, `role:<role>` (only that role and above) | `on` |
+| `SHARE_LINK_MAX_DAYS` | days, empty for no limit | empty |
+
+Every external share is in the audit log, and an admin can list and revoke
+them.
 
 ### 3.8 Operations
 
@@ -266,7 +278,7 @@ OIDC_ISSUER=  OIDC_CLIENT_ID=  OIDC_CLIENT_SECRET=
 OIDC_ROLES_CLAIM=groups        ROLE_MAP=sliqtly-admins:admin,sliqtly-editors:editor,sliqtly-viewers:viewer
 OIDC_ALLOWED_GROUPS=
 MCP_AUTH_MODE=broker           # or external
-SHARE_POLICY=org
+SHARE_DEFAULT=org              SHARE_EXTERNAL=on
 SLIQTLY_OUTBOUND=public        # public | none
 SESSION_SECRET=                # 32 random bytes, base64
 ```
@@ -279,7 +291,7 @@ SliqtlyEnterprise/
 ├─ upstream.json           Sliqtly repo + ref the image is built from
 ├─ server/                 Go: main, config, drivers, auth, api, audit
 │  ├─ store/postgres/      DB interface on Postgres (+ migrations/)
-│  ├─ store/sqlite/
+│  ├─ store/firestore/     (wraps upstream firebase.go)
 │  ├─ files/s3/  files/disk/
 │  ├─ auth/oidc/           login, sessions, roles
 │  ├─ auth/mcp/            broker and external modes
@@ -302,11 +314,6 @@ Postgres, S3, admin, audit, data sources) lives here and wraps upstream's
 `Env`. If wrapping needs upstream's Go to be importable as a package rather
 than `package main`, that refactor is upstream PR #1.
 
-Licensing: upstream is AGPL-3.0-or-later. Shipping it inside a commercial
-product to customers needs either AGPL terms for the whole image or a
-separate commercial licence from the copyright holder. Decide before the
-first customer build.
-
 ## 6. Milestones
 
 Each one ends with something that runs in Compose and an automated test.
@@ -328,7 +335,7 @@ Each one ends with something that runs in Compose and an automated test.
 
 **M2: people sign in**
 - OIDC login, sessions, users, role mapping, allowed groups, logout.
-- `SHARE_POLICY=org`.
+- Company and link shares with the admin settings of 3.7.
 - Done when: e2e test signs in as alice, bob, carol, dave and sees the four
   expected outcomes.
 
@@ -363,7 +370,8 @@ Each one ends with something that runs in Compose and an automated test.
 **M7: cloud packages** (after the Compose version is solid)
 - Helm chart.
 - AWS: CloudFormation/CDK (ECS Fargate, RDS, S3, Secrets Manager, ALB).
-- Google: Terraform (Cloud Run, Cloud SQL or Firestore, GCS, Secret Manager).
+- Google: Terraform (Cloud Run, Cloud SQL postgres or Firestore as the
+  customer chooses, GCS, Secret Manager).
 - Marketplace listings.
 
 ## 7. Security checklist
@@ -382,15 +390,16 @@ Each one ends with something that runs in Compose and an automated test.
 - Rate limits per user and per client (upstream `Limiter`, `Quota`).
 - Distroless, non-root image; dependency and image scanning in CI.
 
-## 8. Open questions
+## 8. Decisions
 
-1. Postgres only, or keep Firestore as an option for the Google package?
-   (Postgres everywhere is simpler to test; Firestore is cheaper to run on
-   GCP.)
-2. Licence model for customers (see section 5).
-3. Is `org` the right default share policy, or should external links be off
-   entirely unless an admin enables them?
-4. Which MCP clients must be verified for the first release (Claude,
+| Question | Decision |
+| --- | --- |
+| Licence for customer builds | not an issue (copyright holder's call) |
+| Database | Postgres by default everywhere; Firestore optional on Google |
+| Sharing | company and external link shares, per share, limited by admin settings (3.7) |
+| MCP server | the Go server (`mcp-go`) only; the Node server is not part of Enterprise |
+
+## 9. Open questions
+
+1. Which MCP clients must be verified for the first release (Claude,
    ChatGPT, Copilot Studio, Cursor)?
-5. Does the Node MCP server (`mcp/`) need to keep working in Enterprise, or
-   is the Go server the only one?
