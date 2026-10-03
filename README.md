@@ -1,12 +1,15 @@
 # Sliqtly Enterprise
 
-[Sliqtly](https://github.com/terotests/sliqtly) packaged for companies to run
-in their own account: sign-in through their own identity provider (OIDC),
-data in their own Postgres and S3 bucket, and the MCP server open to their
-own assistants and services.
+Running [Sliqtly](https://sliqtly.com) inside a company: the MCP server and the
+presentation viewer as one program in Docker or as a single binary, keeping
+presentations on its own disk, reachable from the company's assistants and
+browsers.
 
-First target: a Docker Compose stack that runs everything locally, with
-Keycloak standing in for the company's identity provider. Cloud packages
-(AWS, Google Cloud, Helm) follow from the same image.
+This repository is public and holds deployment only (Compose, Caddy,
+documentation). The server is built from the private Sliqtly repository.
 
-Status: planning. See [docs/PLAN.md](docs/PLAN.md).
+- [docs/PLAN.md](docs/PLAN.md): the pilot, one binary, files on disk, no sign-in
+- [docs/ENTERPRISE.md](docs/ENTERPRISE.md): after the pilot, OIDC sign-in,
+  OAuth for MCP clients, Postgres, S3, cloud packages
+
+Status: planning.

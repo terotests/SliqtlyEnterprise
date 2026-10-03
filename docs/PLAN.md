@@ -1,405 +1,235 @@
-# Sliqtly Enterprise: plan
+# Sliqtly Server: pilot plan
 
-Sliqtly that a company runs in its own account (cloud or on premises), with
-sign-in through its own identity provider, its data in its own database and
-bucket, and the MCP server open to its own assistants and services. The first
-deliverable is a Docker Compose stack that runs the whole thing on a laptop,
-including a stand-in enterprise identity provider, so every part can be tested
-locally before it is packaged for a cloud.
+Goal: run Sliqtly inside a company network as fast as possible. One program
+that an assistant connects to over MCP, that keeps presentations on its own
+disk, and that gives every presentation a URL where people view it, and
+where the assistant (and later people) edit and extend it.
 
-Status: plan. Nothing here is built yet.
+No Google, no cloud account, no database server, no sign-in for the first
+pilot. Those come after, in [ENTERPRISE.md](ENTERPRISE.md).
 
-## 1. Goals
+## 1. What it is
 
-1. `docker compose up` gives a working Sliqtly at `https://sliqtly.localhost`:
-   the editor, shared decks, pictures and data files, the MCP server.
-2. Sign-in is OpenID Connect against the company's identity provider (Entra
-   ID, Okta, Google Workspace, Keycloak, anything OIDC). Locally a Keycloak
-   container plays that part, with demo users and groups.
-3. The MCP endpoint (`/mcp`) is protected by OAuth 2.1 the way MCP clients
-   expect (Claude, ChatGPT, Copilot, Cursor, a company's own agents), and the
-   person behind each token is a user of the company's identity provider.
-4. Services, not just people, can call Sliqtly: client-credentials tokens
-   for MCP and a REST API, and an allowlist of internal data sources that
-   charts may read from.
-5. No call home. Nothing leaves the deployment unless an admin configures it.
-6. The same image later runs on Google Cloud Run, AWS ECS and Kubernetes;
-   only the storage drivers and the installer differ.
+`sliqtly-server`: the MCP server that runs `sliqtly.com/mcp` today
+(`mcp-go/` in the Sliqtly repo, Ranger compiled to Go), with three changes:
 
-Not in the first version: SCIM provisioning, multi-tenant hosting (one
-deployment = one company), SAML directly (Keycloak can broker SAML into
-OIDC), Google Sheets/Drive live data (needs Google; stays optional).
+1. **A file-system store** instead of Firestore and Cloud Storage.
+2. **The viewer and editor built in** (`web/dist` embedded in the binary),
+   so `/s/{id}` opens a presentation from the same server.
+3. **Its own address** in every link it hands out (`SLIQTLY_URL`), instead
+   of `https://sliqtly.com`.
 
-## 2. What upstream Sliqtly is today
-
-Source: [terotests/sliqtly](https://github.com/terotests/sliqtly).
-
-| Part | Today | What ties it to Google |
-| --- | --- | --- |
-| Editor (`web/dist`) | static, built with Ranger, served by Firebase Hosting | `web/sliqtly.js` loads the Firebase SDK and `/__/firebase/init.js` (exists only on Firebase Hosting); `REDIRECT_HOSTS` hard-coded |
-| Sign-in | Firebase Auth, Google accounts only | the browser talks to Firebase Auth directly |
-| Data | Firestore `decks`, `shares`, `mcp_keys`, `mcp_oauth_*`; Storage `shares/{id}/…`, `users/{uid}/…` | the browser reads and writes Firestore and Storage directly, guarded by `firestore.rules` / `storage.rules` |
-| MCP server | `mcp/` (Node, Cloud Function, in production) and `mcp-go/` (Ranger compiled to Go, Cloud Run, prototype); Enterprise uses the Go server only | Firestore, GCS and Firebase ID tokens, all behind interfaces in `mcp-go/host.go` |
-| MCP sign-in | the server is its own OAuth 2.1 authorization server (RFC 8414, 9728, 7591, PKCE S256); `/oauth.html` signs the person in with Firebase and hands back an ID token | identity comes from Firebase |
-| Chart data | `bind_chart_data` and pictures fetch public https URLs only (SSRF guard in `mcp/src/deck.js`, `mcp-go/net.go`) | none, but internal sources are refused |
-
-The Go server is the base for Enterprise: it is one static binary in a
-distroless image (12 MB compressed, cold start well under a second), its
-storage is already behind two small interfaces, and identity behind one
-function:
-
-```go
-type DB interface {           // mcp-go/host.go
-    Get, Set, Update, Delete, WhereEq, ServerTime
-}
-type Bucket interface { Name, Save, Read }
-VerifyIDToken func(ctx, token string) (*IDToken, error)
-```
-
-Postgres, S3 and OIDC implementations slot in beside `firebase.go` without
-touching the Ranger code.
-
-## 3. Architecture
-
-```
-                 company IdP (Entra / Okta / Keycloak)
-                        ▲  OIDC code flow + PKCE
-                        │
- browser ──https──► Caddy ──► sliqtly (one Go binary)
- MCP clients ──────►  │        ├─ /              editor (web/dist)
- internal services ──►│        ├─ /config.js     runtime config for the editor
-                      │        ├─ /auth/*        OIDC login, session cookie
-                      │        ├─ /api/v1/*      decks, shares, files (REST, OpenAPI)
-                      │        ├─ /mcp           MCP (streamable HTTP)
-                      │        ├─ /oauth/*       OAuth 2.1 AS for MCP clients
-                      │        ├─ /.well-known/* RFC 8414 / 9728 metadata
-                      │        └─ /healthz /readyz /metrics
-                      │              │            │
-                      │          Postgres      S3 (MinIO locally)
-```
-
-One image, `sliqtly-enterprise:X.Y.Z`, built from this repository and a
-pinned upstream Sliqtly ref.
-
-### 3.1 Storage drivers
-
-Postgres is the default everywhere, so local, AWS and Google run and are
-tested the same way. Firestore stays as an option for a Google customer who
-prefers it (the existing driver). Selected by environment:
-
-| Setting | Values | Local | GCP | AWS |
-| --- | --- | --- | --- | --- |
-| `SLIQTLY_DB` | `postgres`, `firestore` | postgres | Cloud SQL postgres (default) or Firestore | RDS postgres |
-| `SLIQTLY_FILES` | `s3`, `disk`, `gcs` | s3 (MinIO) | gcs | s3 |
-
-The `DB` interface is document-shaped (collection, id, JSON). Postgres keeps
-one table per collection with `id text primary key, doc jsonb`, plus
-generated columns and indexes for the fields queried (`owner`, `expires`).
-TTL that Firestore does by policy becomes a periodic delete job in the
-server. Schema versions are tracked in a `schema_migrations` table; the
-server runs pending migrations at start and refuses to start against a
-schema newer than it knows.
-
-### 3.2 The editor without Firebase
-
-`web/sliqtly.js` becomes one of two backends behind the same functions it
-exports today (`share`, `loadShare`, `listMine`, `saveShare`, `deleteShare`,
-`putFile`, sign-in):
-
-- `firebase` (sliqtly.com, unchanged)
-- `api` (Enterprise): `fetch` to `/api/v1/*` with the session cookie;
-  sign-in is a redirect to `/auth/login`
-
-`/config.js` tells the page which backend, the base URL, the company name and
-which features are on (Sheets/Drive off unless configured). This change goes
-to upstream Sliqtly so both products build from one editor; Enterprise only
-sets the config.
-
-Access rules that live in `firestore.rules` / `storage.rules` today move into
-the API handlers (owner checks, size limits) and get their own tests.
-
-### 3.3 Sign-in for people
-
-- OIDC authorization code flow with PKCE against `OIDC_ISSUER`, confidential
-  client (`OIDC_CLIENT_ID` / `OIDC_CLIENT_SECRET`), discovery from
-  `/.well-known/openid-configuration`.
-- After login the server keeps a session (Postgres) and sets an `HttpOnly`,
-  `Secure`, `SameSite=Lax` cookie. No tokens in the browser.
-- Users are created on first login from `sub`, `email`, `name`. The user id
-  is `issuer + sub`, never the email.
-- Roles from a configurable claim (`OIDC_ROLES_CLAIM`, e.g. `groups` or
-  `roles`) mapped by `ROLE_MAP`:
-  - `admin`: settings, data sources, audit log, all decks
-  - `editor`: create and share decks
-  - `viewer`: open decks shared inside the company
-- Optional `OIDC_ALLOWED_GROUPS`: anyone outside them is refused.
-- Logout ends the session and calls the IdP's `end_session_endpoint`.
-
-### 3.4 Sign-in for MCP clients
-
-The server stays the OAuth 2.1 authorization server MCP clients discover
-(`/.well-known/oauth-protected-resource`, `/.well-known/oauth-authorization-server`,
-dynamic client registration, client ID metadata documents, PKCE S256, rotating
-refresh tokens), as upstream does now. What changes is who vouches for the
-person: `/oauth/authorize` sends the browser through the same OIDC login as
-the editor (or reuses the session), then shows a consent page naming the
-client and the scopes.
-
-Two modes:
-
-| Mode | When | How |
-| --- | --- | --- |
-| `broker` (default) | most companies; works with every MCP client today | Sliqtly issues its own tokens after IdP login |
-| `external` | the company wants its IdP to issue all tokens (e.g. Entra app registration) | Sliqtly is only a resource server: validates the IdP's JWT access tokens (issuer, audience, signature from JWKS) and advertises the IdP in RFC 9728 metadata |
-
-Scopes: `decks:read`, `decks:write`, `files:write`, `admin`. A token never
-gets more than the user's role allows.
-
-Admin controls: allowed redirect URI patterns, allowed client ids (or open
-dynamic registration), token lifetimes, revoke all tokens of a user or client.
-
-### 3.5 Services that call Sliqtly
-
-- Service clients created by an admin: `client_id` + secret, OAuth
-  client-credentials grant, scopes as above, acting as a named service user.
-- The same tokens work on `/mcp` (an internal agent) and on `/api/v1`
-  (a report generator, a CI job).
-- `/api/v1` is described by an OpenAPI document served at `/api/v1/openapi.json`.
-
-### 3.6 Services Sliqtly reads from
-
-Charts (`bind_chart_data`, `vega-lite` data URLs) and pictures fetch by URL.
-Upstream refuses private addresses. Enterprise adds admin-defined data
-sources:
-
-```yaml
-datasources:
-  - name: finance-api
-    match: https://finance.internal.example.com/reports/
-    headers:
-      Authorization: "Bearer ${secret:finance_token}"
-```
-
-A URL that matches a source may reach that private host, with the
-configured headers added on the server; the secret never reaches the
-browser or the deck. Everything else keeps the public-only rule (and the
-metadata-server block always applies). Outbound access can also be switched
-off entirely (`SLIQTLY_OUTBOUND=none`).
-
-### 3.7 Sharing
-
-Both inside and outside the company. The owner picks per share:
-
-- **Company**: opens only for signed-in users of this deployment
-- **Link**: anyone with the link, as upstream, for customers, partners and
-  the public; optional expiry date and revoke
-
-Admin settings decide what owners may choose:
-
-| Setting | Values | Default |
-| --- | --- | --- |
-| `SHARE_DEFAULT` | `org`, `link` | `org` |
-| `SHARE_EXTERNAL` | `on`, `off`, `role:<role>` (only that role and above) | `on` |
-| `SHARE_LINK_MAX_DAYS` | days, empty for no limit | empty |
-
-Every external share is in the audit log, and an admin can list and revoke
-them.
-
-### 3.8 Operations
-
-- Audit log (Postgres): sign-ins, token grants and revocations, deck
-  create/share/delete, admin changes, data-source use. Export as JSON lines.
-- Structured JSON logs on stdout, Prometheus `/metrics`, OpenTelemetry
-  traces when `OTEL_EXPORTER_OTLP_ENDPOINT` is set.
-- `/healthz` (process up) and `/readyz` (database and bucket reachable).
-- Backups are the database's and bucket's own (pg_dump / snapshots, bucket
-  versioning); `sliqtly-enterprise backup` / `restore` for the Compose setup.
-
-## 4. The local Docker stack
-
-```
-compose.yaml
-├─ caddy       TLS for *.localhost (its own local CA), reverse proxy
-├─ sliqtly     the server (built here, or the released image)
-├─ postgres    16
-├─ minio       S3 API + console; a bucket created on start
-└─ keycloak    stand-in IdP: realm "acme" imported from dev/keycloak/
-```
-
-Demo realm `acme` (dev only):
-
-| User | Password | Groups | Sliqtly role |
-| --- | --- | --- | --- |
-| alice@acme.test | alice | sliqtly-admins | admin |
-| bob@acme.test | bob | sliqtly-editors | editor |
-| carol@acme.test | carol | sliqtly-viewers | viewer |
-| dave@acme.test | dave | (none) | refused |
-
-Plus a service client `acme-reporting` with client-credentials enabled.
-
-Addresses:
+Delivered two ways from one build:
 
 | | |
 | --- | --- |
-| `https://sliqtly.localhost` | the editor |
-| `https://sliqtly.localhost/mcp` | MCP |
-| `https://auth.localhost` | Keycloak (admin console: admin / admin) |
-| `https://minio.localhost` | MinIO console |
+| Docker image | `docker run -p 8080:8080 -v sliqtly-data:/data sliqtly-server` |
+| Static binary | Linux amd64/arm64, Windows, macOS; `./sliqtly-server --data ./data` |
 
-Try it:
+The binary is already static (`CGO_ENABLED=0`, distroless image of a few tens
+of MB), so both are cheap.
+
+```
+ Claude Code / VS Code / Cursor / own agent
+        │  MCP (streamable HTTP)
+        ▼
+ sliqtly-server :8080 ───────────► ./data/
+   /mcp               MCP tools      shares/{id}.json        a presentation
+   /s/{id}            viewer         mcp_keys/{id}.json      its edit key (hash)
+   /s/{id}?edit       editor         files/shares/{id}/...   pictures, data files
+   /api/shares/{id}   deck JSON
+   /files/...         pictures, data files
+   /s/{id}/{n}.jpg    a slide as a picture (server-side render)
+        ▲
+        │  browser
+ people in the network
+```
+
+## 2. Why this is a small change
+
+What the Go server already has, in `mcp-go/`:
+
+- All eleven MCP tools: create, update, get, list, render a slide, render an
+  overview, chart data binding, data files, workbooks, the guide.
+- Storage behind two interfaces in `host.go` (`DB`: get, set, update,
+  delete, query by one field; `Bucket`: save, read). Firestore and GCS are
+  just one implementation, and the tests already use an in-memory one.
+- Edit keys: `create_presentation` returns a key, `update_presentation`
+  needs it. So the assistant can create and keep editing a deck **without
+  anyone signing in**.
+- Server-side rendering of slides to JPEG (`render.go`), which is what
+  "render the documents" needs even without a browser.
+- A link-only mode (`SLIQTLY_STORE=link`) where the whole deck travels in the
+  URL. It works today, but the link points at `sliqtly.com` and decks are
+  not kept, so it is not enough on its own.
+
+What is missing:
+
+| Gap | Where | Size |
+| --- | --- | --- |
+| File-system `DB` and `Bucket` | new `mcp-go/fsstore.go` | ~200 lines + tests |
+| File URLs: `Store.rgr` writes `https://firebasestorage.googleapis.com/...` | a host operator `host_file_url` so the fs store answers `/files/...` | small |
+| Serve `web/dist`, `/s/{id}`, `/api/shares/{id}`, `/files/*` | `mcp-go/main.go` + `go:embed` | small |
+| The page reads a share through Firebase in the browser (`web/sliqtly.js` `loadShare`) | read `/api/shares/{id}` when the page is served by `sliqtly-server` (a `/config.js` flag) | small |
+| PRO, Google sign-in, Sheets/Drive shown on the page | hidden by the same flag | small |
+| `main.go` chooses Firestore or link only | `SLIQTLY_STORE=fs` + `SLIQTLY_DATA` | small |
+
+### Where the code lives
+
+The Sliqtly repository is private and SliqtlyEnterprise is **public**. The
+server code and its builds stay in the Sliqtly repository (`mcp-go/`, a
+`SLIQTLY_STORE=fs` mode beside the Firestore one, so sliqtly.com and the
+company server are one program). Images go to a **private** registry
+(`ghcr.io/terotests/sliqtly-server`, pulled with a token) and binaries to
+releases of the private repo, or are handed over as files
+(`docker save` / the binary).
+
+This repository holds only what is safe to be public: the Compose files,
+the Caddy configurations, install and client set-up documentation.
+
+## 3. Storage
+
+**First adapter: the file system.** One JSON file per document, written to a
+temporary file and renamed, so a crash never leaves half a file. A query by
+owner reads the directory, fine for thousands of decks. Backup is copying
+the folder; moving to another server is moving the folder.
+
+```
+/data
+  shares/k3Fx9a2Q.json
+  mcp_keys/k3Fx9a2Q.json
+  files/shares/k3Fx9a2Q/media/chart.png
+  files/shares/k3Fx9a2Q/data/sales.xlsx
+```
+
+Expired anonymous decks (`expires`, what Firestore's TTL deleted) are removed
+by a sweep once an hour. Pilot default: no expiry.
+
+**Later, behind the same interface,** in this order:
+
+1. SQLite (pure Go driver, binary stays static): one file, many decks,
+   proper indexes.
+2. Postgres (`jsonb`): several server instances, the company's managed
+   database.
+3. MongoDB fits the document-shaped interface just as well; only if a
+   customer asks.
+
+## 4. HTTPS in a company network
+
+The server itself speaks plain HTTP on one port. TLS is in front of it.
+Options, easiest first for a pilot:
+
+| Option | Certificate trusted by browsers? | What it needs | Fits |
+| --- | --- | --- | --- |
+| **The company's existing reverse proxy / ingress** | yes (company CA) | IT adds one route to `http://host:8080` | most companies; ask first |
+| **Caddy + Let's Encrypt, DNS-01** | yes (public CA) | a name under a public domain the company owns (`sliqtly.intra.example.com`) and an API token for its DNS (Cloudflare, Route 53, Azure DNS, ...). The server does **not** need to be reachable from the internet. Caddy renews by itself. | the best self-contained option |
+| **Tailscale** (`tailscale serve`) | yes (`*.ts.net`) | Tailscale allowed in the company | quickest if they use it |
+| **Caddy `tls internal`** (own CA) | only after the root certificate is installed on each machine | distributing one file | a small test group |
+| **Plain HTTP** `http://host:8080` | no TLS | nothing | first smoke test; Claude Code accepts `http://` MCP URLs |
+
+Certbot does the same as Caddy's ACME, but needs a web server and a renewal
+job beside it; Caddy is one container with both. The Compose files in this
+repository will have a profile per option:
 
 ```sh
-cp .env.example .env
-docker compose up -d
-open https://sliqtly.localhost              # sign in as bob@acme.test
-
-# an MCP client
-claude mcp add --transport http sliqtly https://sliqtly.localhost/mcp
-npx @modelcontextprotocol/inspector         # or the MCP Inspector
-
-# a service
-TOKEN=$(curl -s https://sliqtly.localhost/oauth/token \
-  -d grant_type=client_credentials -d client_id=acme-reporting \
-  -d client_secret=... -d scope=decks:write | jq -r .access_token)
-curl -H "Authorization: Bearer $TOKEN" https://sliqtly.localhost/api/v1/decks
+docker compose up -d                                  # plain HTTP :8080
+docker compose --profile acme-dns up -d               # Caddy + Let's Encrypt DNS-01
+docker compose --profile internal-ca up -d            # Caddy with its own CA
 ```
 
-To try a real IdP, set `OIDC_ISSUER`, `OIDC_CLIENT_ID`,
-`OIDC_CLIENT_SECRET` in `.env` and start without the Keycloak profile
-(`docker compose --profile no-idp up`).
+## 5. Which MCP clients reach a server inside the network
 
-Configuration (all environment, documented in `.env.example`):
+A client that connects **from the user's machine** reaches an internal
+address:
 
-```
-SLIQTLY_URL=https://sliqtly.localhost
-SLIQTLY_DB=postgres            DATABASE_URL=postgres://...
-SLIQTLY_FILES=s3               S3_ENDPOINT= S3_BUCKET= S3_ACCESS_KEY= S3_SECRET_KEY=
-OIDC_ISSUER=  OIDC_CLIENT_ID=  OIDC_CLIENT_SECRET=
-OIDC_ROLES_CLAIM=groups        ROLE_MAP=sliqtly-admins:admin,sliqtly-editors:editor,sliqtly-viewers:viewer
-OIDC_ALLOWED_GROUPS=
-MCP_AUTH_MODE=broker           # or external
-SHARE_DEFAULT=org              SHARE_EXTERNAL=on
-SLIQTLY_OUTBOUND=public        # public | none
-SESSION_SECRET=                # 32 random bytes, base64
-```
+- Claude Code: `claude mcp add --transport http sliqtly https://sliqtly.intra.example.com/mcp`
+- VS Code (Copilot agent mode), Cursor, Windsurf: the URL in their MCP settings
+- a company's own agents (any MCP client library)
+- Claude Desktop and other stdio-only set-ups: through a local bridge
+  (`npx mcp-remote https://sliqtly.intra.example.com/mcp`)
 
-## 5. Repository layout
+Clients whose MCP connections are made **from the vendor's cloud** (custom
+connectors on claude.ai, ChatGPT connectors) cannot reach a server that is
+only inside the network. For those the server needs a public address
+(a tunnel or the company's DMZ) and sign-in, which is part of ENTERPRISE.md.
+Check each client's current documentation before the pilot; this changes.
 
-```
-SliqtlyEnterprise/
-├─ docs/PLAN.md            this file
-├─ upstream.json           Sliqtly repo + ref the image is built from
-├─ server/                 Go: main, config, drivers, auth, api, audit
-│  ├─ store/postgres/      DB interface on Postgres (+ migrations/)
-│  ├─ store/firestore/     (wraps upstream firebase.go)
-│  ├─ files/s3/  files/disk/
-│  ├─ auth/oidc/           login, sessions, roles
-│  ├─ auth/mcp/            broker and external modes
-│  ├─ api/                 /api/v1 + openapi.json
-│  └─ datasources/
-├─ Dockerfile              stage 1 fetches upstream at upstream.json's ref,
-│                          builds web/dist and the Ranger → Go code;
-│                          stage 2 builds server/; stage 3 distroless
-├─ compose.yaml  .env.example  Caddyfile
-├─ dev/keycloak/acme-realm.json
-├─ test/e2e/               Playwright + MCP client tests against the stack
-└─ .github/workflows/      build, test, e2e on Compose, signed image
-```
+## 6. Access in the pilot
 
-How Enterprise uses upstream: the Go host in `mcp-go/` and the editor are
-upstream code. Changes that every deployment needs (the editor backend
-switch, `/config.js`, serving `web/dist` from the Go binary, injectable
-`Client` allowlist) go to upstream as PRs. Enterprise-only code (OIDC,
-Postgres, S3, admin, audit, data sources) lives here and wraps upstream's
-`Env`. If wrapping needs upstream's Go to be importable as a package rather
-than `package main`, that refactor is upstream PR #1.
+- The network is the boundary: whoever reaches the server can view a
+  presentation whose id they have.
+- Editing through MCP needs the deck's edit key (exists today).
+- Optional `SLIQTLY_TOKEN`: when set, `/mcp` requires
+  `Authorization: Bearer <token>` (Claude Code: `--header`), so only
+  configured assistants create decks.
+- Saving edits made in the browser editor back to the server needs knowing
+  who is editing. Pilot step 1: the editor shows the deck and edits are kept
+  in the browser (as today without PRO); the assistant saves to the server.
+  Pilot step 2: browser save with the deck's edit key (`/s/{id}?edit&key=…`,
+  the link the assistant already gets). OIDC sign-in replaces this later.
 
-## 6. Milestones
+## 7. Configuration
 
-Each one ends with something that runs in Compose and an automated test.
+| Variable | Default | |
+| --- | --- | --- |
+| `SLIQTLY_URL` | `http://localhost:8080` | the address people and links use |
+| `SLIQTLY_STORE` | `fs` | `fs`, `link` (keep nothing), `firestore` (sliqtly.com) |
+| `SLIQTLY_DATA` | `/data` | the folder for `fs` |
+| `SLIQTLY_TOKEN` | empty | bearer token required on `/mcp` |
+| `SLIQTLY_OUTBOUND` | `public` | `public` (pictures and chart data from public https URLs) or `none` |
+| `PORT` | `8080` | |
 
-**M0: stack skeleton**
-- `upstream.json`, Dockerfile building upstream `mcp-go` and `web/dist`.
-- Compose with Caddy, Postgres, MinIO, Keycloak (realm imported), sliqtly.
-- Upstream PR: the Go server serves `web/dist` and `/config.js`.
-- Done when: the editor opens at `https://sliqtly.localhost` and `/mcp`
-  answers `initialize` (link mode, no sign-in).
+## 8. Steps
 
-**M1: storage**
-- Postgres `DB` and S3/disk `Bucket` drivers, migrations, TTL job.
-- Upstream PR: `web/sliqtly.js` backend switch (`firebase` | `api`).
-- `/api/v1` decks, shares, files with owner checks ported from the rules.
-- Done when: create, share, reopen and delete a deck with pictures; MCP
-  `create_presentation` keeps it in Postgres; driver tests run against
-  real Postgres and MinIO in CI.
+Each step is merged when it has tests and runs in Docker.
 
-**M2: people sign in**
-- OIDC login, sessions, users, role mapping, allowed groups, logout.
-- Company and link shares with the admin settings of 3.7.
-- Done when: e2e test signs in as alice, bob, carol, dave and sees the four
-  expected outcomes.
+**P1, in the Sliqtly repo (`mcp-go/`): file-system store**
+- `fsstore.go`: `DB` and `Bucket` on a folder; `SLIQTLY_STORE=fs`,
+  `SLIQTLY_DATA`.
+- `host_file_url` so file URLs point at `SLIQTLY_URL/files/...`.
+- `/files/*` served from the folder.
+- The existing end-to-end tests (`server_test.go`) run against the fs store
+  as well as the in-memory one.
+- Done when: `go run .` with `SLIQTLY_STORE=fs`, a deck created and updated
+  over MCP survives a restart, `get_presentation` and `render_slide` work.
 
-**M3: MCP clients sign in**
-- `/oauth/authorize` through the OIDC session; consent page; scopes.
-- `external` mode with JWKS validation.
-- Done when: an MCP client test (the Go MCP client upstream already uses)
-  completes registration, authorize, token, refresh and a tool call as bob;
-  Claude Code connects by hand.
+**P2, Sliqtly repo: viewer from the same server**
+- `web/dist` embedded (`go:embed`), `/s/{id}` → the page, `/config.js`.
+- `web/sliqtly.js`: when `/config.js` says self-hosted, `loadShare` is a
+  `fetch("/api/shares/{id}")`; PRO and Google features hidden.
+- Optional: `/s/{id}/{n}.jpg` from `render.go` for previews in chat tools,
+  wikis and e-mail.
+- Done when: the link `create_presentation` returns opens the deck from the
+  server with no request leaving the network (checked with outbound
+  blocked in the test).
 
-**M4: services**
-- Client-credentials grant, admin-created service clients.
-- Data-source allowlist with server-side secrets.
-- OpenAPI document.
-- Done when: `acme-reporting` creates a deck through `/api/v1` and through
-  `/mcp`, and a chart reads from a mock internal service in the stack.
+**P3, Sliqtly repo: build and release**
+- `Dockerfile` target producing the one image (web + server).
+- Workflow: on a tag, image (amd64 + arm64) to the private GHCR and
+  binaries for Linux, Windows, macOS as release assets.
+- Note: generating the Go code needs ~4 GB of memory; done in CI, never on
+  the company's server.
 
-**M5: admin and audit**
-- Admin page: users, roles seen, tokens and clients (revoke), data sources,
-  settings; audit log view and export.
-- Metrics, readiness, OTel.
+**P4, this repo: installation**
+- `compose.yaml` with the three profiles of section 4, `.env.example`,
+  Caddyfiles (DNS-01 for the common DNS providers).
+- `docs/install.md`: Docker, the binary as a systemd service, Windows
+  service; backups; update (`docker compose pull && docker compose up -d`,
+  the data folder is untouched).
+- `docs/clients.md`: Claude Code, VS Code, Cursor, mcp-remote, token header.
 
-**M6: release and updates**
-- Versioned, signed image (cosign) with SBOM; release manifest (version,
-  digest, oldest version it upgrades from, migrations).
-- Update = back up, pull, `docker compose up -d`; migrations are
-  expand/contract so the previous version still runs on the new schema
-  and a rollback is a version change.
-- Editor tabs left open get a "new version, reload" notice from
-  `/api/v1/version` (the build already cache-busts every file with `?v=`).
+**→ Pilot in a company network.**
 
-**M7: cloud packages** (after the Compose version is solid)
-- Helm chart.
-- AWS: CloudFormation/CDK (ECS Fargate, RDS, S3, Secrets Manager, ALB).
-- Google: Terraform (Cloud Run, Cloud SQL postgres or Firestore as the
-  customer chooses, GCS, Secret Manager).
-- Marketplace listings.
-
-## 7. Security checklist
-
-- TLS everywhere, HSTS; cookies `HttpOnly; Secure; SameSite=Lax`; CSRF token
-  on state-changing cookie requests.
-- OIDC: PKCE, `state`, `nonce`, issuer and audience checks, JWKS rotation.
-- OAuth AS: exact redirect URI match (loopback any port, as upstream),
-  short-lived codes, hashed tokens at rest (upstream already hashes),
-  refresh rotation with reuse detection.
-- Server-side authorization on every API route; no rule lives only in the
-  browser.
-- SSRF: public-only unless a data source matches; metadata addresses always
-  blocked; redirects re-checked.
-- Secrets from environment or files (`*_FILE`), never logged.
-- Rate limits per user and per client (upstream `Limiter`, `Quota`).
-- Distroless, non-root image; dependency and image scanning in CI.
-
-## 8. Decisions
-
-| Question | Decision |
-| --- | --- |
-| Licence for customer builds | not an issue (copyright holder's call) |
-| Database | Postgres by default everywhere; Firestore optional on Google |
-| Sharing | company and external link shares, per share, limited by admin settings (3.7) |
-| MCP server | the Go server (`mcp-go`) only; the Node server is not part of Enterprise |
+**P5, after the pilot, from what it teaches**
+- Browser save with the edit key (section 6, step 2).
+- SQLite store.
+- OIDC sign-in and OAuth for MCP clients (ENTERPRISE.md M2–M3).
 
 ## 9. Open questions
 
-1. Which MCP clients must be verified for the first release (Claude,
-   ChatGPT, Copilot Studio, Cursor)?
+1. Which MCP clients will the pilot company use? (Decides whether a public
+   address is needed at all, section 5.)
+2. Does the pilot company have a reverse proxy / internal CA we can use, or
+   a public domain with a DNS API for Let's Encrypt?
+3. Is the network allowed to reach the internet? (Pictures and chart data
+   from public URLs; the page itself will not need it after P2.)
